@@ -68,7 +68,7 @@ async def _run_claude(chat_id: str, text: str, message_id: str, client: lark.Cli
             options=ClaudeAgentOptions(
                 resume=session_id,
                 cwd=CLAUDE_CWD,
-                allowed_tools=["Read", "Edit", "Write", "Bash", "Glob", "Grep"],
+                allowed_tools=["Read", "Edit", "Write", "Bash", "Glob", "Grep", "Skill"],
                 permission_mode="acceptEdits",
             ),
         ):

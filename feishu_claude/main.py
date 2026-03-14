@@ -37,7 +37,7 @@ def _on_message(data: P2ImMessageReceiveV1) -> None:
 
     # Submit async work to the dedicated event loop
     asyncio.run_coroutine_threadsafe(
-        handle_message(chat_id, sender_id, text, _api_client),
+        handle_message(chat_id, sender_id, text, msg.message_id, _api_client),
         _loop,
     )
 

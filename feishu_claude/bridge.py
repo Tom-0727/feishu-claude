@@ -8,7 +8,14 @@ import os
 from collections import defaultdict
 
 import lark_oapi as lark
-from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
+from lark_oapi.api.im.v1 import (
+    CreateMessageRequest,
+    CreateMessageRequestBody,
+    CreateMessageReactionRequest,
+    CreateMessageReactionRequestBody,
+    DeleteMessageReactionRequest,
+)
+from lark_oapi.api.im.v1.model.emoji import Emoji
 from claude_agent_sdk import (
     query,
     ClaudeAgentOptions,
@@ -32,7 +39,7 @@ ALLOWED_USER_IDS: set[str] = set(
 CLAUDE_CWD = os.getenv("CLAUDE_CWD") or os.path.expanduser("~")
 
 
-async def handle_message(chat_id: str, sender_id: str, text: str, client: lark.Client) -> None:
+async def handle_message(chat_id: str, sender_id: str, text: str, message_id: str, client: lark.Client) -> None:
     # Access control
     if ALLOWED_USER_IDS and sender_id not in ALLOWED_USER_IDS:
         return
@@ -44,17 +51,16 @@ async def handle_message(chat_id: str, sender_id: str, text: str, client: lark.C
         return
 
     async with _chat_locks[chat_id]:
-        await _run_claude(chat_id, text, client)
+        await _run_claude(chat_id, text, message_id, client)
 
 
-async def _run_claude(chat_id: str, text: str, client: lark.Client) -> None:
+async def _run_claude(chat_id: str, text: str, message_id: str, client: lark.Client) -> None:
     session_id = sessions.get(chat_id)
     new_session_id: str | None = None
     final_text = ""
     tool_calls: list[str] = []
 
-    # Show "thinking" indicator
-    _send_text(client, chat_id, "⏳ 思考中…")
+    reaction_id = _add_reaction(client, message_id, "Typing")
 
     try:
         async for msg in query(
@@ -75,8 +81,6 @@ async def _run_claude(chat_id: str, text: str, client: lark.Client) -> None:
                 for block in msg.content:
                     if isinstance(block, ToolUseBlock):
                         tool_calls.append(block.name)
-                        # Show progress every time a new tool is called
-                        _send_text(client, chat_id, f"🔧 {block.name}…")
                     elif isinstance(block, TextBlock) and block.text:
                         final_text = block.text
 
@@ -91,7 +95,39 @@ async def _run_claude(chat_id: str, text: str, client: lark.Client) -> None:
     if new_session_id:
         sessions.save(chat_id, new_session_id)
 
+    if reaction_id:
+        _remove_reaction(client, message_id, reaction_id)
     _send_text(client, chat_id, final_text or "(无回复)")
+
+
+def _add_reaction(client: lark.Client, message_id: str, emoji_type: str) -> str | None:
+    req = (
+        CreateMessageReactionRequest.builder()
+        .message_id(message_id)
+        .request_body(
+            CreateMessageReactionRequestBody.builder()
+            .reaction_type(Emoji.builder().emoji_type(emoji_type).build())
+            .build()
+        )
+        .build()
+    )
+    resp = client.im.v1.message_reaction.create(req)
+    if not resp.success():
+        print(f"[add_reaction] error {resp.code}: {resp.msg}")
+        return None
+    return resp.data.reaction_id
+
+
+def _remove_reaction(client: lark.Client, message_id: str, reaction_id: str) -> None:
+    req = (
+        DeleteMessageReactionRequest.builder()
+        .message_id(message_id)
+        .reaction_id(reaction_id)
+        .build()
+    )
+    resp = client.im.v1.message_reaction.delete(req)
+    if not resp.success():
+        print(f"[remove_reaction] error {resp.code}: {resp.msg}")
 
 
 def _send_text(client: lark.Client, chat_id: str, text: str) -> None:

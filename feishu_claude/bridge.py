@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 from collections import defaultdict
+from typing import Any
 
 import lark_oapi as lark
 from lark_oapi.api.im.v1 import (
@@ -46,51 +47,62 @@ async def handle_message(chat_id: str, sender_id: str, text: str, message_id: st
 
     # Built-in commands
     if text.strip() == "/reset":
-        sessions.clear(chat_id)
+        async with _chat_locks[chat_id]:
+            sessions.clear(chat_id)
         _send_text(client, chat_id, "✅ 对话已重置，开始新会话。")
         return
 
-    async with _chat_locks[chat_id]:
-        await _run_claude(chat_id, text, message_id, client)
+    try:
+        async with _chat_locks[chat_id]:
+            await _run_claude(chat_id, text, message_id, client)
+    except Exception as e:
+        print(f"[handle_message] unhandled error: {e}")
+        _send_text(client, chat_id, f"❌ 内部错误：{e}")
 
 
 async def _run_claude(chat_id: str, text: str, message_id: str, client: lark.Client) -> None:
     session_id = sessions.get(chat_id)
     new_session_id: str | None = None
     final_text = ""
-    tool_calls: list[str] = []
+    stderr_lines: list[str] = []
 
     reaction_id = _add_reaction(client, message_id, "Typing")
 
+    gen = query(
+        prompt=text,
+        options=ClaudeAgentOptions(
+            resume=session_id,
+            cwd=CLAUDE_CWD,
+            allowed_tools=["Read", "Edit", "Write", "Bash", "Glob", "Grep", "Skill"],
+            permission_mode="acceptEdits",
+            stderr=lambda line: _collect_stderr(stderr_lines, line),
+            extra_args={"debug-to-stderr": None},
+            env={"CLAUDECODE": ""},  # allow running inside an existing Claude Code session
+        ),
+    )
     try:
-        async for msg in query(
-            prompt=text,
-            options=ClaudeAgentOptions(
-                resume=session_id,
-                cwd=CLAUDE_CWD,
-                allowed_tools=["Read", "Edit", "Write", "Bash", "Glob", "Grep", "Skill"],
-                permission_mode="acceptEdits",
-            ),
-        ):
-            # Capture session id on first message
-            if isinstance(msg, SystemMessage) and msg.subtype == "init":
-                new_session_id = msg.data.get("session_id")
+        async for msg in gen:
+            new_session_id = _extract_session_id(msg) or new_session_id
 
-            # Collect intermediate tool calls for progress display
-            elif isinstance(msg, AssistantMessage):
+            if isinstance(msg, AssistantMessage):
                 for block in msg.content:
                     if isinstance(block, ToolUseBlock):
-                        tool_calls.append(block.name)
-                    elif isinstance(block, TextBlock) and block.text:
+                        continue
+                    if isinstance(block, TextBlock) and block.text:
                         final_text = block.text
-
-            # Final result
             elif isinstance(msg, ResultMessage):
                 final_text = msg.result
-
     except Exception as e:
-        _send_text(client, chat_id, f"❌ 出错了：{e}")
+        details = _format_stderr(stderr_lines)
+        if reaction_id:
+            _remove_reaction(client, message_id, reaction_id)
+        _send_text(client, chat_id, f"❌ 出错了：{e}。{details}")
         return
+    finally:
+        try:
+            await gen.aclose()
+        except Exception:
+            pass
 
     if new_session_id:
         sessions.save(chat_id, new_session_id)
@@ -146,3 +158,26 @@ def _send_text(client: lark.Client, chat_id: str, text: str) -> None:
     resp = client.im.v1.message.create(req)
     if not resp.success():
         print(f"[send_text] error {resp.code}: {resp.msg}")
+
+
+def _extract_session_id(msg: Any) -> str | None:
+    if isinstance(msg, ResultMessage):
+        return msg.session_id
+    if isinstance(msg, SystemMessage):
+        return msg.data.get("session_id")
+    return getattr(msg, "session_id", None)
+
+
+def _collect_stderr(stderr_lines: list[str], line: str) -> None:
+    if not line:
+        return
+    stderr_lines.append(line)
+    if len(stderr_lines) > 20:
+        del stderr_lines[:-20]
+
+
+def _format_stderr(stderr_lines: list[str]) -> str:
+    if not stderr_lines:
+        return "请查看服务端日志。"
+    last_line = stderr_lines[-1]
+    return f"最后日志：{last_line}"

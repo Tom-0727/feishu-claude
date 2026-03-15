@@ -1,0 +1,1 @@
+uv run feishu-claude

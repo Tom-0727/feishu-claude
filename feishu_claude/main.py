@@ -33,11 +33,19 @@ def _on_message(data: P2ImMessageReceiveV1) -> None:
         return
 
     chat_id = msg.chat_id
-    sender_id = data.event.sender.sender_id.open_id
+    sender = data.event.sender.sender_id
+    sender_id = getattr(sender, "open_id", None) or getattr(sender, "user_id", None) or getattr(sender, "union_id", None) or ""
 
     # Submit async work to the dedicated event loop
     asyncio.run_coroutine_threadsafe(
-        handle_message(chat_id, sender_id, text, msg.message_id, _api_client),
+        handle_message(
+            chat_id=chat_id,
+            sender_id=sender_id,
+            text=text,
+            message_id=msg.message_id,
+            thread_id=msg.thread_id,
+            client=_api_client,
+        ),
         _loop,
     )
 
@@ -52,7 +60,7 @@ _event_handler = (
 
 
 def main() -> None:
-    print(f"Starting feishu-claude bot (app_id={APP_ID[:8]}…)")
+    print(f"Starting feishu-claude bot (app_id={APP_ID[:8]}…)", flush=True)
     ws = lark.ws.Client(
         APP_ID,
         APP_SECRET,

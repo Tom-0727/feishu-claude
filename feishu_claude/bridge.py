@@ -15,6 +15,8 @@ from lark_oapi.api.im.v1 import (
     CreateMessageReactionRequest,
     CreateMessageReactionRequestBody,
     DeleteMessageReactionRequest,
+    ReplyMessageRequest,
+    ReplyMessageRequestBody,
 )
 from lark_oapi.api.im.v1.model.emoji import Emoji
 from claude_agent_sdk import (
@@ -40,27 +42,65 @@ ALLOWED_USER_IDS: set[str] = set(
 CLAUDE_CWD = os.getenv("CLAUDE_CWD") or os.path.expanduser("~")
 
 
-async def handle_message(chat_id: str, sender_id: str, text: str, message_id: str, client: lark.Client) -> None:
+async def handle_message(
+    chat_id: str,
+    sender_id: str,
+    text: str,
+    message_id: str,
+    thread_id: str | None,
+    client: lark.Client,
+) -> None:
     # Access control
     if ALLOWED_USER_IDS and sender_id not in ALLOWED_USER_IDS:
         return
+
+    print(
+        "[handle_message] "
+        f"chat_id={chat_id} sender_id={sender_id} "
+        f"message_id={message_id} thread_id={thread_id or '-'}",
+        flush=True,
+    )
 
     # Built-in commands
     if text.strip() == "/reset":
         async with _chat_locks[chat_id]:
             sessions.clear(chat_id)
-        _send_text(client, chat_id, "✅ 对话已重置，开始新会话。")
+        _send_reply(
+            client=client,
+            chat_id=chat_id,
+            message_id=message_id,
+            text="✅ 对话已重置，开始新会话。",
+            reply_in_thread=bool(thread_id),
+        )
         return
 
     try:
         async with _chat_locks[chat_id]:
-            await _run_claude(chat_id, text, message_id, client)
+            await _run_claude(
+                chat_id=chat_id,
+                text=text,
+                message_id=message_id,
+                reply_in_thread=bool(thread_id),
+                client=client,
+            )
     except Exception as e:
-        print(f"[handle_message] unhandled error: {e}")
-        _send_text(client, chat_id, f"❌ 内部错误：{e}")
+        print(f"[handle_message] unhandled error: {e}", flush=True)
+        _send_reply(
+            client=client,
+            chat_id=chat_id,
+            message_id=message_id,
+            text=f"❌ 内部错误：{e}",
+            reply_in_thread=bool(thread_id),
+        )
 
 
-async def _run_claude(chat_id: str, text: str, message_id: str, client: lark.Client) -> None:
+async def _run_claude(
+    chat_id: str,
+    text: str,
+    message_id: str,
+    reply_in_thread: bool,
+    client: lark.Client,
+) -> None:
     session_id = sessions.get(chat_id)
     new_session_id: str | None = None
     final_text = ""
@@ -96,7 +136,13 @@ async def _run_claude(chat_id: str, text: str, message_id: str, client: lark.Cli
         details = _format_stderr(stderr_lines)
         if reaction_id:
             _remove_reaction(client, message_id, reaction_id)
-        _send_text(client, chat_id, f"❌ 出错了：{e}。{details}")
+        _send_reply(
+            client=client,
+            chat_id=chat_id,
+            message_id=message_id,
+            text=f"❌ 出错了：{e}。{details}",
+            reply_in_thread=reply_in_thread,
+        )
         return
     finally:
         try:
@@ -105,11 +151,20 @@ async def _run_claude(chat_id: str, text: str, message_id: str, client: lark.Cli
             pass
 
     if new_session_id:
+        print(f"[session] chat_id={chat_id} session_id={new_session_id}", flush=True)
         sessions.save(chat_id, new_session_id)
 
     if reaction_id:
         _remove_reaction(client, message_id, reaction_id)
-    _send_text(client, chat_id, final_text or "(无回复)")
+    reply_text = final_text or "(无回复)"
+    print(f"[reply] chat_id={chat_id} chars={len(reply_text)}", flush=True)
+    _send_reply(
+        client=client,
+        chat_id=chat_id,
+        message_id=message_id,
+        text=reply_text,
+        reply_in_thread=reply_in_thread,
+    )
 
 
 def _add_reaction(client: lark.Client, message_id: str, emoji_type: str) -> str | None:
@@ -125,7 +180,7 @@ def _add_reaction(client: lark.Client, message_id: str, emoji_type: str) -> str 
     )
     resp = client.im.v1.message_reaction.create(req)
     if not resp.success():
-        print(f"[add_reaction] error {resp.code}: {resp.msg}")
+        print(f"[add_reaction] error {resp.code}: {resp.msg}", flush=True)
         return None
     return resp.data.reaction_id
 
@@ -139,16 +194,16 @@ def _remove_reaction(client: lark.Client, message_id: str, reaction_id: str) -> 
     )
     resp = client.im.v1.message_reaction.delete(req)
     if not resp.success():
-        print(f"[remove_reaction] error {resp.code}: {resp.msg}")
+        print(f"[remove_reaction] error {resp.code}: {resp.msg}", flush=True)
 
 
-def _send_text(client: lark.Client, chat_id: str, text: str) -> None:
+def _send_text(client: lark.Client, receive_id_type: str, receive_id: str, text: str) -> bool:
     req = (
         CreateMessageRequest.builder()
-        .receive_id_type("chat_id")
+        .receive_id_type(receive_id_type)
         .request_body(
             CreateMessageRequestBody.builder()
-            .receive_id(chat_id)
+            .receive_id(receive_id)
             .msg_type("text")
             .content(json.dumps({"text": text}, ensure_ascii=False))
             .build()
@@ -157,14 +212,54 @@ def _send_text(client: lark.Client, chat_id: str, text: str) -> None:
     )
     resp = client.im.v1.message.create(req)
     if not resp.success():
-        print(f"[send_text] error {resp.code}: {resp.msg}")
+        print(
+            f"[send_text] error receive_id_type={receive_id_type} "
+            f"receive_id={receive_id} code={resp.code}: {resp.msg}",
+            flush=True,
+        )
+        return False
+    print(
+        f"[send_text] ok receive_id_type={receive_id_type} receive_id={receive_id} "
+        f"message_id={resp.data.message_id}",
+        flush=True,
+    )
+    return True
+
+
+def _send_reply(
+    client: lark.Client,
+    chat_id: str,
+    message_id: str,
+    text: str,
+    reply_in_thread: bool,
+) -> None:
+    req = (
+        ReplyMessageRequest.builder()
+        .message_id(message_id)
+        .request_body(
+            ReplyMessageRequestBody.builder()
+            .msg_type("text")
+            .content(json.dumps({"text": text}, ensure_ascii=False))
+            .reply_in_thread(reply_in_thread)
+            .build()
+        )
+        .build()
+    )
+    resp = client.im.v1.message.reply(req)
+    if not resp.success():
+        print(f"[send_reply] error {resp.code}: {resp.msg}", flush=True)
+        _send_text(client, "chat_id", chat_id, text)
+        return
+    print(f"[send_reply] ok parent_message_id={message_id} message_id={resp.data.message_id}", flush=True)
 
 
 def _extract_session_id(msg: Any) -> str | None:
     if isinstance(msg, ResultMessage):
-        return msg.session_id
+        return getattr(msg, "session_id", None)
     if isinstance(msg, SystemMessage):
-        return msg.data.get("session_id")
+        # session_id is a direct attribute on SystemMessage (subtype "init"),
+        # not nested inside msg.data
+        return getattr(msg, "session_id", None)
     return getattr(msg, "session_id", None)
 
 

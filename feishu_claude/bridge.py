@@ -74,6 +74,26 @@ async def handle_message(
         )
         return
 
+    if text.strip() == "/compact":
+        try:
+            async with _chat_locks[chat_id]:
+                await _run_compact(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    reply_in_thread=bool(thread_id),
+                    client=client,
+                )
+        except Exception as e:
+            print(f"[handle_message] compact error: {e}", flush=True)
+            _send_reply(
+                client=client,
+                chat_id=chat_id,
+                message_id=message_id,
+                text=f"❌ compact 出错：{e}",
+                reply_in_thread=bool(thread_id),
+            )
+        return
+
     try:
         async with _chat_locks[chat_id]:
             await _run_claude(
@@ -165,6 +185,100 @@ async def _run_claude(
         text=reply_text,
         reply_in_thread=reply_in_thread,
     )
+
+
+async def _run_compact(
+    chat_id: str,
+    message_id: str,
+    reply_in_thread: bool,
+    client: lark.Client,
+) -> None:
+    session_id = sessions.get(chat_id)
+    if not session_id:
+        _send_reply(
+            client=client,
+            chat_id=chat_id,
+            message_id=message_id,
+            text="ℹ️ 当前还没有会话，无需压缩。",
+            reply_in_thread=reply_in_thread,
+        )
+        return
+
+    stderr_lines: list[str] = []
+    boundary_seen = False
+    new_session_id: str | None = None
+    result_subtype: str | None = None
+
+    reaction_id = _add_reaction(client, message_id, "Typing")
+
+    gen = query(
+        prompt="/compact",
+        options=ClaudeAgentOptions(
+            resume=session_id,
+            cwd=CLAUDE_CWD,
+            allowed_tools=[],
+            max_turns=1,
+            permission_mode="bypassPermissions",
+            stderr=lambda line: _collect_stderr(stderr_lines, line),
+            extra_args={"debug-to-stderr": None},
+            env={"CLAUDECODE": ""},
+        ),
+    )
+    try:
+        async for msg in gen:
+            if isinstance(msg, SystemMessage) and msg.subtype == "compact_boundary":
+                boundary_seen = True
+            elif isinstance(msg, ResultMessage):
+                result_subtype = getattr(msg, "subtype", None)
+                new_session_id = getattr(msg, "session_id", None) or new_session_id
+    except Exception as e:
+        details = _format_stderr(stderr_lines)
+        if reaction_id:
+            _remove_reaction(client, message_id, reaction_id)
+        _send_reply(
+            client=client,
+            chat_id=chat_id,
+            message_id=message_id,
+            text=f"❌ compact 出错：{e}。{details}",
+            reply_in_thread=reply_in_thread,
+        )
+        return
+    finally:
+        try:
+            await gen.aclose()
+        except Exception:
+            pass
+
+    if reaction_id:
+        _remove_reaction(client, message_id, reaction_id)
+
+    ok = boundary_seen and result_subtype == "success"
+    if ok:
+        if new_session_id:
+            print(
+                f"[compact] chat_id={chat_id} session_id={new_session_id}",
+                flush=True,
+            )
+            sessions.save(chat_id, new_session_id)
+        _send_reply(
+            client=client,
+            chat_id=chat_id,
+            message_id=message_id,
+            text="✅ 已完成 compact。",
+            reply_in_thread=reply_in_thread,
+        )
+    else:
+        details = _format_stderr(stderr_lines)
+        _send_reply(
+            client=client,
+            chat_id=chat_id,
+            message_id=message_id,
+            text=(
+                f"❌ compact 失败（boundary={boundary_seen}, "
+                f"result={result_subtype or 'none'}）。{details}"
+            ),
+            reply_in_thread=reply_in_thread,
+        )
 
 
 def _add_reaction(client: lark.Client, message_id: str, emoji_type: str) -> str | None:

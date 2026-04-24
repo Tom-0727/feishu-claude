@@ -1,1 +1,1 @@
-uv run feishu-claude
+uv run feishu-claude "$@"

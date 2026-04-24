@@ -1,11 +1,8 @@
-"""
-Core bridge: receive a Feishu message, call Claude Agent SDK, reply back.
-"""
+"""Core bridge: receive a Feishu message, call Claude Agent SDK, reply back."""
 
-import asyncio
+from __future__ import annotations
+
 import json
-import os
-from collections import defaultdict
 from typing import Any
 
 import lark_oapi as lark
@@ -29,65 +26,53 @@ from claude_agent_sdk import (
     ToolUseBlock,
 )
 
-from . import sessions
-
-# Per-chat lock: prevents overlapping Claude calls for the same conversation
-_chat_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
-
-ALLOWED_USER_IDS: set[str] = set(
-    uid.strip()
-    for uid in os.getenv("ALLOWED_USER_IDS", "").split(",")
-    if uid.strip()
-)
-CLAUDE_CWD = os.getenv("CLAUDE_CWD") or os.path.expanduser("~")
+from .runtime import FeishuClaudeRuntime
 
 
 async def handle_message(
-    chat_id: str,
+    runtime: FeishuClaudeRuntime,
     sender_id: str,
     text: str,
     message_id: str,
     thread_id: str | None,
     client: lark.Client,
 ) -> None:
-    # Access control
-    if ALLOWED_USER_IDS and sender_id not in ALLOWED_USER_IDS:
+    if runtime.allowed_user_ids and sender_id not in runtime.allowed_user_ids:
         return
 
     print(
-        "[handle_message] "
-        f"chat_id={chat_id} sender_id={sender_id} "
-        f"message_id={message_id} thread_id={thread_id or '-'}",
+        f"[runtime:{runtime.runtime_id}] "
+        f"sender_id={sender_id} message_id={message_id} thread_id={thread_id or '-'}",
         flush=True,
     )
 
-    # Built-in commands
-    if text.strip() == "/reset":
-        async with _chat_locks[chat_id]:
-            sessions.clear(chat_id)
+    command = text.strip()
+    if command == "/reset":
+        async with runtime.lock:
+            runtime.sessions.clear()
         _send_reply(
             client=client,
-            chat_id=chat_id,
+            chat_id=runtime.chat_id,
             message_id=message_id,
             text="✅ 对话已重置，开始新会话。",
             reply_in_thread=bool(thread_id),
         )
         return
 
-    if text.strip() == "/compact":
+    if command == "/compact":
         try:
-            async with _chat_locks[chat_id]:
+            async with runtime.lock:
                 await _run_compact(
-                    chat_id=chat_id,
+                    runtime=runtime,
                     message_id=message_id,
                     reply_in_thread=bool(thread_id),
                     client=client,
                 )
         except Exception as e:
-            print(f"[handle_message] compact error: {e}", flush=True)
+            print(f"[runtime:{runtime.runtime_id}] compact error: {e}", flush=True)
             _send_reply(
                 client=client,
-                chat_id=chat_id,
+                chat_id=runtime.chat_id,
                 message_id=message_id,
                 text=f"❌ compact 出错：{e}",
                 reply_in_thread=bool(thread_id),
@@ -95,19 +80,19 @@ async def handle_message(
         return
 
     try:
-        async with _chat_locks[chat_id]:
+        async with runtime.lock:
             await _run_claude(
-                chat_id=chat_id,
+                runtime=runtime,
                 text=text,
                 message_id=message_id,
                 reply_in_thread=bool(thread_id),
                 client=client,
             )
     except Exception as e:
-        print(f"[handle_message] unhandled error: {e}", flush=True)
+        print(f"[runtime:{runtime.runtime_id}] unhandled error: {e}", flush=True)
         _send_reply(
             client=client,
-            chat_id=chat_id,
+            chat_id=runtime.chat_id,
             message_id=message_id,
             text=f"❌ 内部错误：{e}",
             reply_in_thread=bool(thread_id),
@@ -115,13 +100,13 @@ async def handle_message(
 
 
 async def _run_claude(
-    chat_id: str,
+    runtime: FeishuClaudeRuntime,
     text: str,
     message_id: str,
     reply_in_thread: bool,
     client: lark.Client,
 ) -> None:
-    session_id = sessions.get(chat_id)
+    session_id = runtime.sessions.get()
     new_session_id: str | None = None
     final_text = ""
     stderr_lines: list[str] = []
@@ -132,12 +117,12 @@ async def _run_claude(
         prompt=text,
         options=ClaudeAgentOptions(
             resume=session_id,
-            cwd=CLAUDE_CWD,
-            allowed_tools=["Read", "Edit", "Write", "Bash", "Glob", "Grep", "Skill"],
-            permission_mode="acceptEdits",
+            cwd=str(runtime.config.cwd),
+            allowed_tools=list(runtime.config.allowed_tools),
+            permission_mode=runtime.config.permission_mode,
             stderr=lambda line: _collect_stderr(stderr_lines, line),
             extra_args={"debug-to-stderr": None},
-            env={"CLAUDECODE": ""},  # allow running inside an existing Claude Code session
+            env={"CLAUDECODE": ""},
         ),
     )
     try:
@@ -158,7 +143,7 @@ async def _run_claude(
             _remove_reaction(client, message_id, reaction_id)
         _send_reply(
             client=client,
-            chat_id=chat_id,
+            chat_id=runtime.chat_id,
             message_id=message_id,
             text=f"❌ 出错了：{e}。{details}",
             reply_in_thread=reply_in_thread,
@@ -171,16 +156,22 @@ async def _run_claude(
             pass
 
     if new_session_id:
-        print(f"[session] chat_id={chat_id} session_id={new_session_id}", flush=True)
-        sessions.save(chat_id, new_session_id)
+        print(
+            f"[runtime:{runtime.runtime_id}] session_id={new_session_id}",
+            flush=True,
+        )
+        runtime.sessions.save(new_session_id)
 
     if reaction_id:
         _remove_reaction(client, message_id, reaction_id)
     reply_text = final_text or "(无回复)"
-    print(f"[reply] chat_id={chat_id} chars={len(reply_text)}", flush=True)
+    print(
+        f"[runtime:{runtime.runtime_id}] reply chars={len(reply_text)}",
+        flush=True,
+    )
     _send_reply(
         client=client,
-        chat_id=chat_id,
+        chat_id=runtime.chat_id,
         message_id=message_id,
         text=reply_text,
         reply_in_thread=reply_in_thread,
@@ -188,16 +179,16 @@ async def _run_claude(
 
 
 async def _run_compact(
-    chat_id: str,
+    runtime: FeishuClaudeRuntime,
     message_id: str,
     reply_in_thread: bool,
     client: lark.Client,
 ) -> None:
-    session_id = sessions.get(chat_id)
+    session_id = runtime.sessions.get()
     if not session_id:
         _send_reply(
             client=client,
-            chat_id=chat_id,
+            chat_id=runtime.chat_id,
             message_id=message_id,
             text="ℹ️ 当前还没有会话，无需压缩。",
             reply_in_thread=reply_in_thread,
@@ -215,7 +206,7 @@ async def _run_compact(
         prompt="/compact",
         options=ClaudeAgentOptions(
             resume=session_id,
-            cwd=CLAUDE_CWD,
+            cwd=str(runtime.config.cwd),
             allowed_tools=[],
             max_turns=1,
             permission_mode="bypassPermissions",
@@ -237,7 +228,7 @@ async def _run_compact(
             _remove_reaction(client, message_id, reaction_id)
         _send_reply(
             client=client,
-            chat_id=chat_id,
+            chat_id=runtime.chat_id,
             message_id=message_id,
             text=f"❌ compact 出错：{e}。{details}",
             reply_in_thread=reply_in_thread,
@@ -256,13 +247,13 @@ async def _run_compact(
     if ok:
         if new_session_id:
             print(
-                f"[compact] chat_id={chat_id} session_id={new_session_id}",
+                f"[runtime:{runtime.runtime_id}] compact session_id={new_session_id}",
                 flush=True,
             )
-            sessions.save(chat_id, new_session_id)
+            runtime.sessions.save(new_session_id)
         _send_reply(
             client=client,
-            chat_id=chat_id,
+            chat_id=runtime.chat_id,
             message_id=message_id,
             text="✅ 已完成 compact。",
             reply_in_thread=reply_in_thread,
@@ -271,7 +262,7 @@ async def _run_compact(
         details = _format_stderr(stderr_lines)
         _send_reply(
             client=client,
-            chat_id=chat_id,
+            chat_id=runtime.chat_id,
             message_id=message_id,
             text=(
                 f"❌ compact 失败（boundary={boundary_seen}, "
@@ -364,15 +355,17 @@ def _send_reply(
         print(f"[send_reply] error {resp.code}: {resp.msg}", flush=True)
         _send_text(client, "chat_id", chat_id, text)
         return
-    print(f"[send_reply] ok parent_message_id={message_id} message_id={resp.data.message_id}", flush=True)
+    print(
+        f"[send_reply] ok parent_message_id={message_id} "
+        f"message_id={resp.data.message_id}",
+        flush=True,
+    )
 
 
 def _extract_session_id(msg: Any) -> str | None:
     if isinstance(msg, ResultMessage):
         return getattr(msg, "session_id", None)
     if isinstance(msg, SystemMessage):
-        # session_id is a direct attribute on SystemMessage (subtype "init"),
-        # not nested inside msg.data
         return getattr(msg, "session_id", None)
     return getattr(msg, "session_id", None)
 

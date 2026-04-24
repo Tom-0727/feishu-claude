@@ -1,37 +1,66 @@
-"""
-Persist chat_id -> claude_session_id mappings to disk.
-Each Feishu chat gets its own Claude session for continuous conversation.
-"""
+"""Per-runtime Claude session persistence and one-shot legacy migration."""
+
+from __future__ import annotations
 
 import json
 from pathlib import Path
 
-_STORE = Path.home() / ".feishu-claude" / "sessions.json"
+from .config import ServiceConfig
 
 
-def _load() -> dict[str, str]:
-    if not _STORE.exists():
-        return {}
+_LEGACY_STORE = Path.home() / ".feishu-claude" / "sessions.json"
+
+
+class SessionStore:
+    def __init__(self, path: Path) -> None:
+        self._path = path
+
+    def get(self) -> str | None:
+        if not self._path.exists():
+            return None
+        try:
+            data = json.loads(self._path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        value = data.get("session_id") if isinstance(data, dict) else None
+        return value if isinstance(value, str) and value else None
+
+    def save(self, session_id: str) -> None:
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._path.write_text(
+            json.dumps({"session_id": session_id}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    def clear(self) -> None:
+        if self._path.exists():
+            self._path.unlink()
+
+
+def migrate_legacy_sessions(config: ServiceConfig) -> None:
+    if not _LEGACY_STORE.exists():
+        return
     try:
-        return json.loads(_STORE.read_text())
+        legacy = json.loads(_LEGACY_STORE.read_text(encoding="utf-8"))
     except Exception:
-        return {}
+        legacy = None
+    if not isinstance(legacy, dict):
+        _LEGACY_STORE.unlink()
+        return
 
+    for runtime_config in config.runtimes.values():
+        session_id = legacy.get(runtime_config.chat_id)
+        if not isinstance(session_id, str) or not session_id:
+            continue
+        store = SessionStore(runtime_config.session_path)
+        if store.get():
+            continue
+        store.save(session_id)
+        print(
+            f"[migrate] runtime={runtime_config.runtime_id} "
+            f"chat_id={runtime_config.chat_id} session_id={session_id}",
+            flush=True,
+        )
 
-def get(chat_id: str) -> str | None:
-    return _load().get(chat_id)
-
-
-def save(chat_id: str, session_id: str) -> None:
-    _STORE.parent.mkdir(parents=True, exist_ok=True)
-    data = _load()
-    data[chat_id] = session_id
-    _STORE.write_text(json.dumps(data, indent=2, ensure_ascii=False))
-
-
-def clear(chat_id: str) -> None:
-    """Reset a chat's session (start fresh conversation)."""
-    data = _load()
-    data.pop(chat_id, None)
-    _STORE.parent.mkdir(parents=True, exist_ok=True)
-    _STORE.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+    _LEGACY_STORE.unlink()
+    print("[migrate] removed legacy sessions.json", flush=True)

@@ -1,0 +1,14 @@
+apps:
+  main:
+    app_id: cli_xxx
+    app_secret: xxx
+
+runtimes:
+  default:
+    app: main
+    chat_id: oc_xxx
+    allowed_user_ids: []
+    claude:
+      cwd: /home/ubuntu
+      allowed_tools: [Read, Edit, Write, Bash, Glob, Grep, Skill]
+      permission_mode: acceptEdits

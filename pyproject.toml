@@ -10,7 +10,7 @@ requires-python = ">=3.13"
 dependencies = [
     "claude-agent-sdk>=0.0.14",
     "lark-oapi>=1.4.0",
-    "python-dotenv>=1.0.0",
+    "pyyaml>=6.0",
 ]
 
 [project.scripts]
